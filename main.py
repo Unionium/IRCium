@@ -4,7 +4,8 @@ import threading
 import random
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QLineEdit, 
-                            QTextEdit, QListWidget, QSplitter, QMessageBox)
+                            QTextEdit, QListWidget, QListWidgetItem, QSplitter,
+                            QMessageBox, QInputDialog)
 from PyQt5.QtGui import QFont, QColor, QTextCursor, QTextCharFormat
 from PyQt5.QtCore import Qt, QSize, pyqtSignal, QObject
 try: 
@@ -12,21 +13,51 @@ try:
 except Exception:
     pass
 
+class ServerItem(QListWidgetItem):
+    def __init__(self, server_name):
+        super().__init__(server_name)
+        self.server_name = server_name
+        font = QFont("Consolas", 12)
+        font.setBold(True)
+        self.setFont(font)
+        self.setForeground(QColor("#5a4a6d"))
+        self.setSizeHint(QSize(0, 30))
+
+class ChannelItem(QListWidgetItem):
+    def __init__(self, channel_name):
+        super().__init__(channel_name)
+        self.channel_name = channel_name.replace("⎣ ", "")
+        self.setFont(QFont("Consolas", 11))
+        self.setForeground(QColor("#e8e8e8"))
+        self.setSizeHint(QSize(0, 25))
+
+class AddItem(QListWidgetItem):
+    def __init__(self, parent=None):
+        super().__init__("Add...")
+        font = QFont("Consolas", 10)  # Сначала создаем шрифт
+        font.setItalic(True)          # Затем устанавливаем курсив
+        self.setFont(font)            # Применяем шрифт
+        self.setForeground(QColor("#888888"))
+        self.setSizeHint(QSize(0, 25))
+
 class IRCSignals(QObject):
     message_received = pyqtSignal(str, str)  # channel, message
     event_received = pyqtSignal(str)         # event message
     connection_error = pyqtSignal(str)       # error message
+    topic_received = pyqtSignal(str, str)    # channel, topic
+    names_received = pyqtSignal(str, list)   # channel, names list
 
 class IRCClient:
     def __init__(self):
         self.server = str(sys.argv[1])
         self.port = int(sys.argv[2])
-        self.nick = sys.argv[3] if len(sys.argv) > 3 else "Guest" + str(random.randint(1000, 9999)) # input("Nickname > ")# "Guest" + str(random.randint(1000, 9999))
+        self.nick = sys.argv[3] if len(sys.argv) > 3 else "Guest" + str(random.randint(1000, 9999))
         self.usetranslator = sys.argv[4].lower() in ("true", "yes", "1", "on") if len(sys.argv) > 4 else False
         self.current_channel = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.running = False
         self.signals = IRCSignals()
+        self.channel_users = {}  # Словарь для хранения пользователей каналов
         
     def connect(self):
         try:
@@ -51,6 +82,9 @@ class IRCClient:
         self._send(f"JOIN {channel}")
         self.current_channel = channel
         self.signals.event_received.emit(f"Joined {channel}")
+        # Запрашиваем TOPIC и список пользователей
+        self._send(f"TOPIC {channel}")
+        self._send(f"NAMES {channel}")
     
     def receive_messages(self):
         while self.running:
@@ -77,31 +111,78 @@ class IRCClient:
                         sender = line.split("!")[0][1:]
                         if self.usetranslator:
                             try:
-                                traslation = translate_plugin.on_russian(message)
-                                
+                                translation = translate_plugin.on_russian(message)
                                 self.signals.message_received.emit(channel, f"<{sender}> {translation}")
-                            except Exception:
+                            except Exception as e:
+                                print(e)
                                 self.signals.message_received.emit(channel, f"<{sender}> {message}")
                         else:
                             self.signals.message_received.emit(channel, f"<{sender}> {message}")
 
+                    # Обработка TOPIC
+                    elif " 332 " in line:  # RPL_TOPIC
+                        parts = line.split(" 332 ")
+                        channel = parts[1].split()[1]
+                        topic = parts[1].split(":", 1)[1]
+                        self.signals.topic_received.emit(channel, topic)
+                    
+                    # Обработка списка пользователей (NAMES)
+                    elif " 353 " in line:  # RPL_NAMREPLY
+                        parts = line.split(" 353 ")
+                        channel = parts[1].split()[2]
+                        names = parts[1].split(":", 1)[1].split()
+                        self.channel_users[channel] = names
+                        self.signals.names_received.emit(channel, names)
+                    
+                    # Обработка JOIN
+                    elif "JOIN" in line:
+                        nick = line.split("!")[0][1:]
+                        channel = line.split("JOIN")[1].strip()
+                        if channel in self.channel_users:
+                            if nick not in self.channel_users[channel]:
+                                self.channel_users[channel].append(nick)
+                                self.signals.names_received.emit(channel, self.channel_users[channel])
+                        self.signals.event_received.emit(f"{nick} joined {channel}")
+                    
+                    # Обработка PART
+                    elif "PART" in line:
+                        nick = line.split("!")[0][1:]
+                        channel = line.split("PART")[1].strip()
+                        if channel in self.channel_users and nick in self.channel_users[channel]:
+                            self.channel_users[channel].remove(nick)
+                            self.signals.names_received.emit(channel, self.channel_users[channel])
+                        self.signals.event_received.emit(f"{nick} left {channel}")
+                    
+                    # Обработка QUIT
+                    elif "QUIT" in line:
+                        nick = line.split("!")[0][1:]
+                        for channel in self.channel_users:
+                            if nick in self.channel_users[channel]:
+                                self.channel_users[channel].remove(nick)
+                                self.signals.names_received.emit(channel, self.channel_users[channel])
+                        self.signals.event_received.emit(f"{nick} quit")
+                    
+                    # Обработка NICK
+                    elif "NICK" in line:
+                        old_nick = line.split("!")[0][1:]
+                        new_nick = line.split("NICK")[1].strip()[1:]
+                        for channel in self.channel_users:
+                            if old_nick in self.channel_users[channel]:
+                                index = self.channel_users[channel].index(old_nick)
+                                self.channel_users[channel][index] = new_nick
+                                self.signals.names_received.emit(channel, self.channel_users[channel])
+                        self.signals.event_received.emit(f"{old_nick} is now known as {new_nick}")
+
                     else:
-                        # Обработка других событий (JOIN, PART, QUIT и т.д.)
-                        if "JOIN" in line:
-                            nick = line.split("!")[0][1:]
-                            channel = line.split("JOIN")[1].strip()
-                            self.signals.event_received.emit(f"{nick} joined {channel}")
-                        elif "PART" in line:
-                            nick = line.split("!")[0][1:]
-                            channel = line.split("PART")[1].strip()
-                            self.signals.event_received.emit(f"{nick} left {channel}")
-                        elif "QUIT" in line:
-                            nick = line.split("!")[0][1:]
-                            self.signals.event_received.emit(f"{nick} quit")
-                        elif "NICK" in line:
-                            old_nick = line.split("!")[0][1:]
-                            new_nick = line.split("NICK")[1].strip()[1:]
-                            self.signals.event_received.emit(f"{old_nick} is now known as {new_nick}")
+                        # Обработка других событий
+                        if "KICK" in line:
+                            parts = line.split("KICK")
+                            channel = parts[1].split()[0]
+                            kicked = parts[1].split()[1]
+                            if channel in self.channel_users and kicked in self.channel_users[channel]:
+                                self.channel_users[channel].remove(kicked)
+                                self.signals.names_received.emit(channel, self.channel_users[channel])
+                            self.signals.event_received.emit(f"{kicked} was kicked from {channel}")
 
             except Exception as e:
                 self.signals.connection_error.emit(f"Receive error: {e}")
@@ -166,8 +247,9 @@ class CozyIRCClient(QMainWindow):
         left_layout.setSpacing(0)
         
         self.channel_list = QListWidget()
-        self.channel_list.setFont(QFont("", 24))
-        self.channel_list.itemDoubleClicked.connect(self.join_selected_channel)
+        self.channel_list.setFont(QFont("", 11))
+        self.channel_list.itemClicked.connect(self.handle_item_click)
+        self.populate_server_list()
         
         # Кнопки под списком каналов
         button_widget = QWidget()
@@ -227,9 +309,41 @@ class CozyIRCClient(QMainWindow):
         chat_layout.addWidget(self.chat_display)
         chat_layout.addWidget(input_widget)
         
+        # Панель информации (правая панель)
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
+        # Топик канала
+        self.topic_label = QLabel("Channel Topic")
+        self.topic_label.setAlignment(Qt.AlignCenter)
+        self.topic_label.setStyleSheet("background-color: #2a2a2a; padding: 5px;")
+        
+        self.topic_text = QTextEdit()
+        self.topic_text.setReadOnly(True)
+        self.topic_text.setFont(QFont("Consolas", 10))
+        self.topic_text.setStyleSheet("background-color: #1e1e1e; padding: 5px;")
+        
+        # Список пользователей
+        self.users_label = QLabel("Channel Users")
+        self.users_label.setAlignment(Qt.AlignCenter)
+        self.users_label.setStyleSheet("background-color: #2a2a2a; padding: 5px;")
+        
+        self.users_list = QListWidget()
+        self.users_list.setFont(QFont("Consolas", 11))
+        self.users_list.setStyleSheet("background-color: #1e1e1e;")
+        
+        # Добавляем виджеты в правую панель
+        right_layout.addWidget(self.topic_label)
+        right_layout.addWidget(self.topic_text)
+        right_layout.addWidget(self.users_label)
+        right_layout.addWidget(self.users_list)
+        
         # Добавляем виджеты в splitter
         splitter.addWidget(left_panel)
         splitter.addWidget(chat_widget)
+        splitter.addWidget(right_panel)
         
         main_layout.addWidget(splitter)
         
@@ -240,6 +354,8 @@ class CozyIRCClient(QMainWindow):
         self.irc_client.signals.message_received.connect(self.add_message)
         self.irc_client.signals.event_received.connect(self.add_event)
         self.irc_client.signals.connection_error.connect(self.show_error)
+        self.irc_client.signals.topic_received.connect(self.update_topic)
+        self.irc_client.signals.names_received.connect(self.update_users_list)
         
         # Добавляем тестовые сообщения для демонстрации
         self.add_sample_events()
@@ -373,6 +489,36 @@ class CozyIRCClient(QMainWindow):
         # Прокручиваем вниз
         self.chat_display.ensureCursorVisible()
     
+    def update_topic(self, channel, topic):
+        """Обновляет топик канала в правой панели"""
+        if channel == self.irc_client.current_channel:
+            self.topic_text.setPlainText(topic)
+    
+    def update_users_list(self, channel, users):
+        """Обновляет список пользователей в правой панели"""
+        if channel == self.irc_client.current_channel:
+            self.users_list.clear()
+            # Сортируем пользователей (операторы и голосованные первыми)
+            ops = [user for user in users if user.startswith("@")]
+            voiced = [user for user in users if user.startswith("+")]
+            normal = [user for user in users if not user.startswith(("@", "+"))]
+            
+            # Добавляем в список с разными цветами
+            for user in sorted(ops):
+                item = QListWidgetItem(user)
+                item.setForeground(QColor("#ff5555"))  # Красный для операторов
+                self.users_list.addItem(item)
+            
+            for user in sorted(voiced):
+                item = QListWidgetItem(user)
+                item.setForeground(QColor("#55ff55"))  # Зеленый для голосованных
+                self.users_list.addItem(item)
+            
+            for user in sorted(normal):
+                item = QListWidgetItem(user)
+                item.setForeground(QColor("#e8e8e8"))  # Белый для обычных пользователей
+                self.users_list.addItem(item)
+    
     def show_error(self, error):
         """Показывает сообщение об ошибке"""
         QMessageBox.critical(self, "Error", error)
@@ -436,13 +582,120 @@ class CozyIRCClient(QMainWindow):
         self.add_event("Welcome to Ircium Client!")
         self.add_event("Please connect to a server")
         # Добавляем тестовые каналы
-        self.channel_list.addItems(["#main", "#general"])
+        # self.channel_list.addItems(["#main", "#general"])
+        # Добавляем тестовый топик
+        self.topic_text.setPlainText("Welcome to our channel! Please be nice to each other.")
+        # Добавляем тестовых пользователей
+        test_users = ["@Operator1", "+VoicedUser", "RegularUser1", "RegularUser2"]
+        self.update_users_list("#main", test_users)
     
     def closeEvent(self, event):
         """Обработчик закрытия окна"""
         if self.irc_client.running:
             self.irc_client.disconnect()
         event.accept()
+
+    def populate_server_list(self):
+        """Заполняет список серверов и каналов
+        self.channel_list.clear()
+        
+        # Сервер 1
+        server1 = ServerItem("irc.386.su")
+        self.channel_list.addItem(server1)
+        
+        channel1 = ChannelItem("⎣ #main")
+        self.channel_list.addItem(channel1)
+        
+        channel2 = ChannelItem("⎣ #usue")
+        self.channel_list.addItem(channel2)
+        
+        add_channel1 = AddItem()
+        self.channel_list.addItem(add_channel1)
+        
+        # Разделитель
+        self.channel_list.addItem(QListWidgetItem(""))
+        
+        # Сервер 2
+        server2 = ServerItem("irc.qw3rtylife.ru")
+        self.channel_list.addItem(server2)
+        
+        channel3 = ChannelItem("⎣ #general")
+        self.channel_list.addItem(channel3)
+        
+        channel4 = ChannelItem("⎣ #linux")
+        self.channel_list.addItem(channel4)
+        
+        add_channel2 = AddItem()
+        self.channel_list.addItem(add_channel2)
+        
+        # Разделитель
+        self.channel_list.addItem(QListWidgetItem(""))
+        """
+        # Добавление нового сервера
+        add_server = AddItem()
+        add_server.setText("Add server...")
+        self.channel_list.addItem(add_server)
+
+    
+    def handle_item_click(self, item):
+        """Обрабатывает клики по элементам списка"""
+        if isinstance(item, AddItem):
+            if item.text() == "Add server...":
+                self.add_new_server()
+            else:
+                self.add_new_channel(item)
+        elif isinstance(item, ChannelItem):
+            self.join_channel(item.channel_name.replace("⎣ ", ""))
+    
+    def add_new_server(self):
+        """Добавляет новый сервер"""
+        server_name, ok = QInputDialog.getText(self, "Add Server", "Enter server address:")
+        if ok and server_name:
+            # Находим последний элемент "Add server..." и вставляем перед ним
+            for i in range(self.channel_list.count()):
+                item = self.channel_list.item(i)
+                if isinstance(item, AddItem) and item.text() == "Add server...":
+                    server_item = ServerItem(server_name)
+                    self.channel_list.insertItem(i, server_item)
+                    
+                    channel_item = ChannelItem("⎣ #general")
+                    self.channel_list.insertItem(i+1, channel_item)
+                    
+                    add_channel = AddItem()
+                    self.channel_list.insertItem(i+2, add_channel)
+                    
+                    # Добавляем разделитель
+                    self.channel_list.insertItem(i+3, QListWidgetItem(""))
+                    break
+    
+    def add_new_channel(self, add_item):
+        """Добавляет новый канал"""
+        # Находим родительский сервер
+        server_item = None
+        row = self.channel_list.row(add_item)
+        for i in range(row-1, -1, -1):
+            item = self.channel_list.item(i)
+            if isinstance(item, ServerItem):
+                server_item = item
+                break
+        
+        if server_item:
+            channel_name, ok = QInputDialog.getText(self, "Add Channel", 
+                                                  f"Enter channel name for {server_item.server_name}:")
+            if ok and channel_name:
+                if not channel_name.startswith("#"):
+                    channel_name = "#" + channel_name
+                
+                # Вставляем перед кнопкой "Add..."
+                channel_item = ChannelItem(f"⎣ {channel_name}")
+                self.channel_list.insertItem(row, channel_item)
+    
+    def join_channel(self, channel_name):
+        """Присоединяется к выбранному каналу"""
+        if channel_name.startswith("#"):
+            self.irc_client.join_channel(channel_name)
+            self.add_event(f"Joining {channel_name}...")
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
